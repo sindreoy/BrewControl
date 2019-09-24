@@ -1,0 +1,13 @@
+# Update and install required software
+sudo apt update
+sudo apt install python3-pip qt5-default pyqt5-dev pyqt5-dev-tools
+
+# Install Python modules required
+sudo pip3 install -r requirements/production.txt
+
+# Create alias to set python3 to default
+echo "alias python='/usr/bin/python3'" >> /home/pi/.bashrc
+echo "alias pip='/usr/bin/pip3'" >> /home/pi/.bashrc
+
+# Apply changes to bashrc
+source /home/pi/.bashrc
