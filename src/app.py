@@ -11,8 +11,9 @@ __email__ = "sindre.bakke.oyen@gmail.com"
 __status__ = "Production"
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import pyqtSignal, pyqtSlot
 
-# import RPi.GPIO as GPIO
+import RPi.GPIO as GPIO
 import threading
 import numpy as np
 import pyqtgraph as pg
@@ -20,6 +21,7 @@ import os
 import time
 
 from w1thermsensor import W1ThermSensor
+
 sensor = W1ThermSensor()
 
 """
@@ -32,8 +34,8 @@ sensor = W1ThermSensor()
 CONTROL_OPTIONS = ["PI", "LQR", "MPC"]
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 UPDATE_PLOT_TIME_CONSTANT = 3  # Three seconds intervals
-UPDATE_CONTROL_TIME_CONSTANT = 3 # Three seconds intervals
-THORIZON = 30
+UPDATE_CONTROL_TIME_CONSTANT = 3  # Three seconds intervals
+THORIZON = 30  # Plot 30 seconds back in time
 
 # Plot options
 pg.setConfigOption("background", "w")
@@ -49,6 +51,10 @@ RED_PEN = pg.mkPen("r", width=3, style=QtCore.Qt.DashLine)
 
 
 class Ui_MainWindow(QtWidgets.QMainWindow):  # Edited inherited
+    # Signal to indicate new data acquisition
+    # Note: signals need to be defined inside a QObject class/subclass
+    data_acquired = pyqtSignal(np.ndarray)
+
     def __init__(self):
         super(Ui_MainWindow, self).__init__()
         self.setupUi(self)
@@ -84,32 +90,160 @@ class Ui_MainWindow(QtWidgets.QMainWindow):  # Edited inherited
         # Set initial time
         self.t0 = time.time()
 
+        # Set default temperature setpoint
+        self.temperature_setpoint_spinbox.setValue(67.00)
+        self.change_temperature_setpoint()
+
         # Initialise time and temperature arrays
         self.time_arr = np.zeros(100)
         self.Ts_arr = np.zeros(100)
         self.T_arr = np.zeros(100)
 
-        # Event that triggers stop control loop
-        self.control_stop_event = threading.Event()
-        # Event that triggers stop plot loop
-        self.plot_stop_event = threading.Event()
+        # Connect the signal
+        self.data_acquired.connect(self.update)
+
+        # Event that kills plotting thread
+        self.plot_threadkill = threading.Event()
+        # Thread that starts plotting
+        self.plot_thread = threading.Thread(
+            name="plotting_thread",
+            target=self.generate_data,
+            args=(self.data_acquired.emit, self.plot_threadkill),
+        )
+        self.plot_thread.start()
+
+        # Event that kills controller thread
+        self.control_threadkill = threading.Event()
         # Thread that starts control loop
         self.controller_thread = threading.Thread(
             name="control_worker",
             target=self.control_temperature,
-            args=(self.control_stop_event,),
-        )
-        # Thread that starts plotting
-        self.plotting_thread = threading.Thread(
-            name="plotting_thread",
-            target=self.update,
-            args=(self.plot_stop_event,),
+            args=(self.control_threadkill,),
         )
 
-        # Set default temperature setpoint
-        self.temperature_setpoint_spinbox.setValue(67.00)
-        self.change_temperature_setpoint()
-        self.start_plotting()
+    # Kill our data acquisition thread when shutting down
+    def closeEvent(self, close_event):
+        print("PyQt5 application terminating!")
+        self.plot_threadkill.set()
+        print("Plotting thread killed")
+        if self.controller_thread.is_alive():
+            self.control_threadkill.set()
+            print("Controller thread killed")
+        else:
+            print("Controller thread already dead")
+
+    def generate_data(self, callback, plot_threadkill):
+        while not plot_threadkill.is_set():
+            self.time_arr[self.ptr] = time.time() - self.t0
+            self.Ts_arr[self.ptr] = self.temperature_setpoint_lcd.value()
+
+            # Update measurements
+            # Use this line for testing outside production environment
+            # self.T_arr[self.ptr] = np.cos(self.time_arr[self.ptr])
+            T_meas = sensor.get_temperature()
+            self.temperature_measurement_lcd.display(f"{T_meas:3.2f}")
+            self.T_arr[self.ptr] = T_meas
+            # Update pointer denoting how many measurements we have
+            self.ptr += 1
+            if self.ptr >= self.Ts_arr.shape[0]:
+                # If array has values in all its indices, double its size
+                # TODO: Add a doubling of size of measurement array
+                tmp_Ts = self.Ts_arr
+                tmp_T = self.T_arr
+                tmp_t = self.time_arr
+                self.Ts_arr = np.zeros(self.Ts_arr.shape[0] * 2)
+                self.T_arr = np.zeros(self.T_arr.shape[0] * 2)
+                self.time_arr = np.zeros(self.time_arr.shape[0] * 2)
+                self.Ts_arr[: tmp_Ts.shape[0]] = tmp_Ts
+                self.T_arr[: tmp_T.shape[0]] = tmp_T
+                self.time_arr[: tmp_t.shape[0]] = tmp_t
+            t = self.time_arr
+            T_set = self.Ts_arr
+            T_meas = self.T_arr
+            data = np.stack([t, T_set, T_meas], axis=0)
+            callback(data)
+            time.sleep(UPDATE_PLOT_TIME_CONSTANT)
+
+    # Slot to receive acquired data and update plot
+    @pyqtSlot(np.ndarray)
+    def update(self, data):
+        xs_to_plot = self.time_arr - self.time_arr[self.ptr - 1]
+        indices = np.where(xs_to_plot[: self.ptr] > -THORIZON)
+        xs_to_plot = xs_to_plot[indices]
+        ys_to_plot = self.Ts_arr[indices]
+        ymeas_to_plot = self.T_arr[indices]
+        if ys_to_plot.size > 1:
+            Ts = self.Ts_arr
+            T = self.T_arr
+            ymin = 0.9 * np.min(np.minimum(Ts, T))
+            ymax = 1.1 * np.max(np.maximum(Ts, T))
+            self.history_graphics.setRange(
+                xRange=[-THORIZON, 0], yRange=[ymin, ymax], update=True
+            )
+            self.curveTs.setData(
+                xs_to_plot,
+                ys_to_plot[:-1],
+                stepMode=True,
+                parent=self.history_graphics,
+            )
+            self.curveT.setData(
+                xs_to_plot, ymeas_to_plot, parent=self.history_graphics
+            )
+
+    def pump_off(self):
+        GPIO.output(2, GPIO.LOW)
+        print("Pump is off")
+
+    def pump_on(self):
+        GPIO.output(2, GPIO.HIGH)
+        print("Pump is on")
+
+    def change_temperature_setpoint(self):
+        print("Changing temperature setpoint")
+        value = self.temperature_setpoint_spinbox.value()
+        self.temperature_setpoint_lcd.display(value)
+        print(self.temperature_setpoint_lcd.value())
+        self.temperature_setpoint_lcd.repaint()
+
+    def start_control(self):
+        control_option = self.control_technique_dropdown.currentText()
+        print(f"Starter regulering med {control_option}")
+
+        # If event has been set, reset the variable
+        if self.control_threadkill.is_set():
+            self.stop_event = threading.Event()
+
+        # If threads are not started, start them
+        if not self.controller_thread.is_alive():
+            self.controller_thread = threading.Thread(
+                name="control_worker",
+                target=self.control_temperature,
+                args=(self.control_threadkill,),
+            )
+            self.controller_thread.start()
+
+    def control_temperature(self, control_threadkill):
+        while not control_threadkill.is_set():
+            print("Regulerer!!!")
+            time.sleep(UPDATE_CONTROL_TIME_CONSTANT)
+
+    def stop_control(self):
+        button_reply = QtWidgets.QMessageBox.question(
+            self,
+            "Obs!",
+            "Vil du virkelig stoppe reguleringen?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if button_reply == QtWidgets.QMessageBox.Yes:
+            try:
+                self.control_threadkill.set()
+            except AttributeError:
+                pass
+            finally:
+                print("Stopper regulering!")
+        else:
+            print("Regulering fortsetter")
 
     # Auto-generated starts here
     def setupUi(self, MainWindow):
@@ -292,125 +426,11 @@ class Ui_MainWindow(QtWidgets.QMainWindow):  # Edited inherited
         self.history_label.setText(_translate("MainWindow", "Historikk"))
         # Auto-generated code stops here
 
-    def pump_off(self):
-        GPIO.output(2, GPIO.LOW)
-        print("Pump is off")
-
-    def pump_on(self):
-        GPIO.output(2, GPIO.HIGH)
-        print("Pump is on")
-
-    def change_temperature_setpoint(self):
-        print("Changing temperature setpoint")
-        value = self.temperature_setpoint_spinbox.value()
-        self.temperature_setpoint_lcd.display(value)
-        print(self.temperature_setpoint_lcd.value())
-        self.temperature_setpoint_lcd.repaint()
-
-    def start_plotting(self):
-        if not self.plotting_thread.is_alive():
-            self.plotting_thread = threading.Thread(
-                name="plotting_thread",
-                target=self.update,
-                args=(self.plot_stop_event,),
-            )
-            self.plotting_thread.start()
-
-    def start_control(self):
-        control_option = self.control_technique_dropdown.currentText()
-        print(f"Starter regulering med {control_option}")
-
-        # If event has been set, reset the variable
-        if self.control_stop_event.is_set():
-            self.stop_event = threading.Event()
-
-        # If threads are not started, start them
-        if not self.controller_thread.is_alive():
-            self.controller_thread = threading.Thread(
-                name="control_worker",
-                target=self.control_temperature,
-                args=(self.control_stop_event,),
-            )
-            self.controller_thread.start()
-
-    def control_temperature(self, control_stop_event):
-        while not control_stop_event.is_set():
-            print("Regulerer!!!")
-            time.sleep(UPDATE_CONTROL_TIME_CONSTANT)
-
-    def stop_control(self):
-        button_reply = QtWidgets.QMessageBox.question(
-            self,
-            "Obs!",
-            "Vil du virkelig stoppe reguleringen?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        if button_reply == QtWidgets.QMessageBox.Yes:
-            try:
-                self.control_stop_event.set()
-            except AttributeError:
-                pass
-            finally:
-                print("Stopper regulering!")
-        else:
-            print("Regulering fortsetter")
-
-    def update(self, plot_stop_event):
-        while not plot_stop_event.is_set():
-            self.time_arr[self.ptr] = time.time() - self.t0
-            self.Ts_arr[self.ptr] = self.temperature_setpoint_lcd.value()
-            # Update measurements
-            T_meas = sensor.get_temperature()
-            self.temperature_measurement_lcd.display(f"{T_meas:3.2f}")
-            self.T_arr[self.ptr] = T_meas
-            # Update pointer denoting how many measurements we have
-            self.ptr += 1
-            if self.ptr >= self.Ts_arr.shape[0]:
-                # If array has values in all its indices, double its size
-                tmp_Ts = self.Ts_arr
-                tmp_t = self.time_arr
-                self.Ts_arr = np.zeros(self.Ts_arr.shape[0] * 2)
-                self.time_arr = np.zeros(self.time_arr.shape[0] * 2)
-                self.Ts_arr[: tmp_Ts.shape[0]] = tmp_Ts
-                self.time_arr[: tmp_t.shape[0]] = tmp_t
-            xs_to_plot = self.time_arr - self.time_arr[self.ptr - 1]
-            indices = np.where(xs_to_plot[: self.ptr] > -THORIZON)
-            xs_to_plot = xs_to_plot[indices]
-            print(indices)
-            ys_to_plot = self.Ts_arr[indices]
-            ymeas_to_plot = self.T_arr[indices]
-            print(self.T_arr)
-            print(ymeas_to_plot)
-            if ys_to_plot.size > 1:
-                Ts = self.Ts_arr
-                T = self.T_arr
-                ymin = 0.9 * np.min(np.minimum(Ts, T))
-                ymax = 1.1 * np.max(np.maximum(Ts, T))
-                self.history_graphics.setRange(
-                    xRange=[-THORIZON, 0], yRange=[ymin, ymax], update=True
-                )
-                #print(ymeas_to_plot)
-                self.curveTs.setData(
-                    xs_to_plot,
-                    ys_to_plot[:-1],
-                    stepMode=True,
-                    parent=self.history_graphics,
-                )
-                self.curveT.setData(
-                    xs_to_plot,
-                    ymeas_to_plot,
-                    parent=self.history_graphics,
-                )
-            time.sleep(UPDATE_PLOT_TIME_CONSTANT)
-
 
 if __name__ == "__main__":
     import sys
 
     app = QtWidgets.QApplication(sys.argv)
-    # MainWindow = QtWidgets.QMainWindow()
     ui = Ui_MainWindow()
-    # ui.setupUi(MainWindow)
     ui.show()
     sys.exit(app.exec_())
